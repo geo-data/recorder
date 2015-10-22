@@ -300,13 +300,14 @@ We took a number of decisions for the design of the recorder and its utilities:
 As mentioned earlier, data is stored in files, and these files are relative to `STORAGEDIR` (compiled into the programs or specified as an option). In particular, the following directory structure can exist, whereby directories are created as needed by the _recorder_:
 
 * `cards/`, optional, contains user cards which are published when either you or one of your trackers on Hosted adds a new device. This card is then stored here and used with, e.g., `ocat --last` to show a user's name and optional avatar.
+* `config/`, optional, contains the JSON of a [device configuration](http://owntracks.org/booklet/features/remoteconfig/) (`.otrc`)  which was requested remotely via a [dump command](http://owntracks.org/booklet/tech/json/#_typecmd). Note that this will contain sensitive data.
 * `ghash/`, unless disabled, reverse Geo data is collected into an LMDB database located in this directory.
 * `last/` contains the last location published by devices. E.g. Jane's last publish from her iPhone would be in `last/jjolie/iphone/jjolie-iphone.json`. The JSON payload contained therein is enhanced with the fields `user`, `device`, `topic`, and `ghash`.
 * `monitor` a file which contains a timestamp and the last received topic (see Monitoring below).
 * `msg/` contains messages received by the Messaging system.
 * `photos/` optional; contains the binary photos from a _card_.
 * `rec/` the recorder data proper. One subdirectory per user, one subdirectory therein per device. Data files are named `YYYY-MM.rec` (e.g. `2015-08.rec` for the data accumulated during the month of August 2015.
-* `waypoints/` contains a directory per user and device. Therein are individual files named by a timestamp with the JSON payload of published (i.e. shared) waypoints. The file names are timestamps because the `tst` of a waypoint is its key.
+* `waypoints/` contains a directory per user and device. Therein are individual files named by a timestamp with the JSON payload of published (i.e. shared) waypoints. The file names are timestamps because the `tst` of a waypoint is its key. If a user publishes all waypoints from a device (Publish Waypoints), the payload is stored in this directory as `username-device.otrw`. (Note, that this is the JSON [waypoints import format](http://owntracks.org/booklet/tech/json/#_typewaypoints).)
 
 You should definitely **not** modify or touch these files: they remain under the control of the _recorder_. You can of course, remove old `.rec` files if they consume too much space.
 
@@ -326,6 +327,35 @@ This can be used to subsequently obtain missed lookups.
 
 We recommend you keep reverse-geo lookups enabled, this data (country code `cc`, and the locations address `addr`) is used by the example Web apps provided by the _recorder_ to show where a particular device is. In addition, this cached data is used the the API (also _ocat_) when printing location data.
 
+### Precision
+
+The precision with which reverse-geo lookups are performed is controlled with the `--precison` option to _recorder_ (and with the `--precision` option to _ocat_ when you query for data). The default precision is compiled into the code (from `config.mk`). The higher the number, the more frequently lookups are performed; conversely, the lower the number, the fewer lookups are performed. For example, a precision of 1 means that points within an area of approximately 5000 km^2 would resolve to a single address, whereas a precision of 7 means that points within an area of approximately 150 m^2 resolve to one address. The _recorder_ obtains a location publish, extracts the latitude and longitude, and then calculates the [geohash](https://en.wikipedia.org/wiki/Geohash) string and truncates it to _precision_. If the calculated geohash string can be found in our local LMDB cache, we consider the point cached; otherwise an actual reverse geo lookup (via HTTP) is performed and the result is cached in LMDB at the key of the geohash.
+
+As an example, let's assume Jane's device is at position (lat, lon) `48.879840, 2.323522`, which resolves to a geohash string of length 7 `u09whf7`. We can [visualize this](http://www.movable-type.co.uk/scripts/geohash.html) and show what this looks like. (See also: [visualizing geohash](http://www.bigdatamodeling.org/2013/01/intuitive-geohash.html).)
+
+![geohash7](assets/geohash-7.png)
+
+Every location publish outside that very small blue square would mean another lookup. If, however, we lower the precision to, say, 5, a much larger area is covered
+
+![geohash5](assets/geohash-5.png)
+
+and a precision of 2 would mean that a very large part of France resolves to a single address:
+
+![geohash2](assets/geohash-2.png)
+
+The bottom line: if you run the _recorder_ with just a few devices and want to know quite exactly where you've been, use a high precision (7 is probably good). If you, on the other hand, run _recorder_ with many devices and are only interested in where a device was approximately, lower the precision; this also has the effect that fewer reverse-geo lookups will be performed in the Google infrastructure. (Also: respect their quotas!)
+
+### The geo cache
+
+As hinted to above, the address data obtained through a reverse-geo lookup is stored in an embedded LMDB database, the content of which we can look at with
+
+```
+$ ocat --dump
+u09whf7 {"cc":"FR","addr":"1 Rue de Saint-Pétersbourg, 75008 Paris, France","tst":1445435622,"locality":"Paris"}
+u09ey1r {"cc":"FR","addr":"D83, 91590 La Ferté-Alais, France","tst":1445435679,"locality":"La Ferté-Alais"}
+```
+
+The key to this data is the geohash string (here with an example of precision 2).
 
 ## Monitoring
 
@@ -412,6 +442,9 @@ The reported timestamp was the time at which this cache entry was made. Note tha
 
 Requires POST method and _user_. This is currently incomplete; it simply writes a key into LMDB consisting of "blockme user".
 
+#### `photo`
+
+Requires GET method and _user_, and will return the `image/png` 40x40px photograph of a user if available in `STORAGEDIR/photos/` or a transparent 40x40png with a black border otherwise.
 
 #### `kill`
 
@@ -469,7 +502,7 @@ This is invoked when the _recorder_ stops, which it doesn't really do unless you
 This function is invoked at every location publish processed by the _recorder_. Your function is passed three arguments:
 
 1. _topic_ is the topic published to (e.g. `owntracks/jane/phone`)
-2. _type_ is the type of MQTT message. This is the `_type` in our JSON messages (e.g. `location`) or `"unknown"`.
+2. _type_ is the type of MQTT message. This is the `_type` in our JSON messages (e.g. `location`, `cmd`, `transition`, ...) or `"unknown"`.
 3. _location_ is a [Lua table](http://www.lua.org/pil/2.5.html) (associative array) with all the elements obtained in the JSON message. In the case of _type_ being `location`, we also add country code (`cc`) and the location's address (`addr`) unless reverse-geo lookups have been disabled in _recorder_.
 
 Assume the following small example Lua script in `example.lua`:
@@ -561,6 +594,23 @@ server {
     	proxy_set_header	X-Forwarded-For $proxy_add_x_forwarded_for;
     }
 }
+```
+
+### Apache
+
+Assuming you want to use Apache as a reverse proxy to the recorder, the following
+may get you started. This will hand URIs which begin with `/otr/` to the _Recorder_.
+
+```
+
+# Websocket URL endpoint
+# a2enmod proxy_wstunnel
+ProxyPass        /otr/ws        ws://127.0.0.1:8083/ws keepalive=on retry=60
+ProxyPassReverse /otr/ws        ws://127.0.0.1:8083/ws keepalive=on
+
+# Static files
+ProxyPass /otr                  http://127.0.0.1:8083/
+ProxyPassReverse /otr           http://127.0.0.1:8083/
 ```
 
 ## Advanced topics

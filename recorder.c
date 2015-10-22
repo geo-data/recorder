@@ -228,7 +228,7 @@ static int csv_looks_sane(char *payload)
 {
 	static int virgin = 1;
 	static regex_t regex;
-	int reti, sane = FALSE;
+	int nomatch;
 	int cflags = REG_EXTENDED | REG_ICASE | REG_NOSUB;
 
 	if (virgin) {
@@ -240,13 +240,9 @@ static int csv_looks_sane(char *payload)
 		}
 	}
 
-	reti = regexec(&regex, payload, 0, NULL, 0);
-	if (!reti) {
-		sane = TRUE;
-	}
+	nomatch = regexec(&regex, payload, 0, NULL, 0);
 
-	// regfree(&regex);
-	return (sane);
+	return (nomatch ? FALSE : TRUE);
 }
 
 /*
@@ -326,6 +322,72 @@ static void putrec(struct udata *ud, time_t now, UT_string *reltopic, UT_string 
 	}
 }
 
+/*
+ * Payload contains JSON string with a configuration obtained
+ * via cmd `dump' to the device. Store it "pretty".
+ */
+
+void config_dump(struct udata *ud, UT_string *username, UT_string *device, char *payloadstring)
+{
+	JsonNode *json;
+	static UT_string *ts = NULL;
+	char *pretty_js;
+
+	if ((json = json_decode(payloadstring)) == NULL) {
+		olog(LOG_ERR, "Cannot decode JSON from %s", payloadstring);
+		return;
+	}
+	pretty_js = json_stringify(json, "\t");
+	json_delete(json);
+
+	utstring_renew(ts);
+
+	utstring_printf(ts, "%s/%s/%s/%s",
+				STORAGEDIR,
+				"config",
+				UB(username),
+				UB(device));
+	if (mkpath(UB(ts)) < 0) {
+		olog(LOG_ERR, "Cannot mkdir %s: %m", UB(ts));
+		return;
+	}
+
+	utstring_printf(ts, "/%s-%s.otrc", UB(username), UB(device));
+	if (ud->verbose) {
+		printf("Received configuration dump, storing at %s\n", UB(ts));
+	}
+	safewrite(UB(ts), pretty_js);
+	free(pretty_js);
+}
+
+/*
+ * Payload contains JSON string with an array of waypoints. Dump
+ * these into a single file.
+ */
+
+void waypoints_dump(struct udata *ud, UT_string *username, UT_string *device, char *payloadstring)
+{
+	static UT_string *ts = NULL;
+
+	utstring_renew(ts);
+
+	utstring_printf(ts, "%s/%s/%s/%s",
+				STORAGEDIR,
+				"waypoints",
+				UB(username),
+				UB(device));
+	if (mkpath(UB(ts)) < 0) {
+		olog(LOG_ERR, "Cannot mkdir %s: %m", UB(ts));
+		return;
+	}
+
+	utstring_printf(ts, "/%s-%s.otrw", UB(username), UB(device));
+	if (ud->verbose) {
+		printf("Received waypoints dump, storing at %s\n", UB(ts));
+	}
+	safewrite(UB(ts), payloadstring);
+}
+
 void on_message(struct mosquitto *mosq, void *userdata, const struct mosquitto_message *m)
 {
 	JsonNode *json, *j, *geo = NULL;
@@ -340,6 +402,7 @@ void on_message(struct mosquitto *mosq, void *userdata, const struct mosquitto_m
 	char *jsonstring, *_typestr = NULL;
 	time_t now;
 	int pingping = FALSE, skipslash = 0;
+	int r_ok = TRUE;			/* True if recording enabled for a publish */
 	payload_type _type;
 
 	/*
@@ -430,8 +493,24 @@ void on_message(struct mosquitto *mosq, void *userdata, const struct mosquitto_m
 
 	if ((json = json_decode(m->payload)) == NULL) {
 		if ((json = csv_to_json(m->payload)) == NULL) {
+#ifdef WITH_RONLY
+			/*
+			 * If the base topic belongs to an RONLY user, store
+			 * the payload.
+			 */
+
+			char buf[BUFSIZ];
+			long blen;
+
+			blen = gcache_get(ud->ronlydb, UB(basetopic), buf, sizeof(buf));
+			if (blen > 0) {
+				// puts("*** storing plain publis");
+				putrec(ud, now, reltopic, username, device, bindump(m->payload, m->payloadlen));
+			}
+#else
 			/* It's not JSON or it's not a location CSV; store it */
 			putrec(ud, now, reltopic, username, device, bindump(m->payload, m->payloadlen));
+#endif
 			return;
 		}
 	}
@@ -440,6 +519,58 @@ void on_message(struct mosquitto *mosq, void *userdata, const struct mosquitto_m
 		json_delete(json);
 		return;
 	}
+
+#ifdef WITH_RONLY
+
+	/*
+	 * This is a special mode in which location (and a few other)
+	 * publishes will be recorded only if r:true in the payload.
+	 * If we cannot find `r' in the JSON, or if `r' isn't true,
+	 * set r_ok to FALSE. We cannot just bail out here, because
+	 * we still want info, cards &c.
+	 */
+
+	if ((j = json_find_member(json, "r")) == NULL) {
+
+		char buf[BUFSIZ];
+		long blen;
+
+		r_ok = FALSE;
+
+		/*
+		 * This JSON payload might actually belong to an RONLY user
+		 * but it doesn't have an `r:true' in it. Determine whether
+		 * the basetopic belongs to such a user, and force r_ok
+		 * accordingly.
+		 */
+
+		blen = gcache_get(ud->ronlydb, UB(basetopic), buf, sizeof(buf));
+		if (blen > 0) {
+			r_ok = TRUE;
+			// printf("*** forcing TRUE b/c ronlydb (blen=%ld)\n", blen);
+		}
+	} else {
+		r_ok = TRUE;
+		if ((j->tag != JSON_BOOL) || (j->bool_ == FALSE)) {
+			r_ok = FALSE;
+		}
+	}
+
+	/*
+	 * The payload contains an `r:true' so we can make a note of this
+	 * base topic in RONLYdb.
+	 */
+
+	if (r_ok == TRUE) {
+		int rc;
+		if ((rc =gcache_put(ud->ronlydb, UB(basetopic), m->payload)) != 0)
+			olog(LOG_ERR, "Cannot store %s in ronlydb: rc==%d", UB(basetopic), rc);
+	} else {
+		int rc;
+		if ((rc = gcache_del(ud->ronlydb, UB(basetopic))) != 0)
+			olog(LOG_ERR, "Cannot delete %s from ronlydb: rc==%d", UB(basetopic), rc);
+	}
+#endif
 
 	_type = T_UNKNOWN;
 	if ((j = json_find_member(json, "_type")) != NULL) {
@@ -456,6 +587,7 @@ void on_message(struct mosquitto *mosq, void *userdata, const struct mosquitto_m
 			else if (!strcmp(j->string_, "transition"))	_type = T_TRANSITION;
 			else if (!strcmp(j->string_, "waypoint"))	_type = T_WAYPOINT;
 			else if (!strcmp(j->string_, "waypoints"))	_type = T_WAYPOINTS;
+			else if (!strcmp(j->string_, "dump"))		_type = T_DUMP;
 		}
 	}
 
@@ -471,17 +603,30 @@ void on_message(struct mosquitto *mosq, void *userdata, const struct mosquitto_m
 		case T_CONFIG:
 		case T_LWT:
 		case T_STEPS:
+			if (r_ok) {
+				putrec(ud, now, reltopic, username, device, bindump(m->payload, m->payloadlen));
+			}
+			goto cleanup;
 		case T_WAYPOINTS:
-			putrec(ud, now, reltopic, username, device, bindump(m->payload, m->payloadlen));
+			waypoints_dump(ud, username, device, m->payload);
+			goto cleanup;
+		case T_DUMP:
+			config_dump(ud, username, device, m->payload);
 			goto cleanup;
 		case T_WAYPOINT:
 		case T_TRANSITION:
 		case T_LOCATION:
 			break;
 		default:
-			putrec(ud, now, reltopic, username, device, bindump(m->payload, m->payloadlen));
+			if (r_ok) {
+				putrec(ud, now, reltopic, username, device, bindump(m->payload, m->payloadlen));
+			}
 			goto cleanup;
 	}
+
+
+	if (r_ok == FALSE)
+		goto cleanup;
 
 	/*
 	 * We are now handling location-related JSON.  Normalize tst, lat, lon
@@ -839,6 +984,9 @@ int main(int argc, char **argv)
 #ifdef WITH_LMDB
 	udata.gc		= NULL;
 	udata.t2t		= NULL;		/* Topic to TID */
+# ifdef WITH_RONLY
+	udata.ronlydb		= NULL;		/* RONLY db */
+# endif
 #endif
 #ifdef WITH_HTTP
 	udata.mgserver		= NULL;
@@ -1022,6 +1170,13 @@ int main(int argc, char **argv)
 		}
 		gcache_close(gt);
 #endif /* !LUA */
+#ifdef WITH_RONLY
+		if ((gt = gcache_open(path, "ronlydb", FALSE)) == NULL) {
+			fprintf(stderr, "Cannot lmdb-open `ronly'\n");
+			exit(2);
+		}
+		gcache_close(gt);
+#endif /* !RONLY */
 #endif
 		exit(0);
 	}
@@ -1108,6 +1263,9 @@ int main(int argc, char **argv)
 # ifdef WITH_LUA
 	ud->luadb = gcache_open(err, "luadb", FALSE);
 # endif
+# ifdef WITH_RONLY
+	ud->ronlydb = gcache_open(err, "ronlydb", FALSE);
+# endif
 #endif
 
 #ifdef WITH_LUA
@@ -1116,9 +1274,10 @@ int main(int argc, char **argv)
 	 */
 
 	if (luascript) {
-		if ((udata.luadata = hooks_init(ud, luascript)) == NULL)
-			olog(LOG_NOTICE, "proceeding sans Lua");
-		free(luascript);
+		if ((udata.luadata = hooks_init(ud, luascript)) == NULL) {
+			olog(LOG_ERR, "Stopping because Lua load failed");
+			exit(1);
+		}
 	}
 #endif
 

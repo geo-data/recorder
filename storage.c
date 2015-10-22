@@ -1059,6 +1059,15 @@ JsonNode *kill_datastore(char *user, char *device)
 		olog(LOG_NOTICE, "removed %s", UB(path));
 	}
 
+	/* Remove config (.otrc) */
+	utstring_renew(path);
+	utstring_printf(path, "%s/config/%s-%s.otrc", STORAGEDIR, user, device);
+	if (remove(UB(path)) == 0) {
+		olog(LOG_NOTICE, "removed %s", UB(path));
+		json_append_member(obj, "otrc", json_mkstring(UB(path)));
+	}
+
+
 	/* Remove waypoint files and containing directories */
 	utstring_renew(path);
 	utstring_printf(path, "%s/waypoints/%s/%s/*.json", STORAGEDIR, user, device);
@@ -1075,6 +1084,13 @@ JsonNode *kill_datastore(char *user, char *device)
 		json_append_member(obj, "waypoint", list);
 	}
 	globfree(&results);
+
+	utstring_renew(path);
+	utstring_printf(path, "%s/waypoints/%s/%s/%s-%s.otrw", STORAGEDIR, user, device, user, device);
+	if (remove(UB(path)) == 0) {
+		olog(LOG_NOTICE, "removed %s", UB(path));
+		json_append_member(obj, "otrw", json_mkstring(UB(path)));
+	}
 
 	utstring_renew(path);
 	utstring_printf(path, "%s/waypoints/%s/%s", STORAGEDIR, user, device);
@@ -1102,7 +1118,6 @@ JsonNode *kill_datastore(char *user, char *device)
 static void emit_one(JsonNode *j, JsonNode *inttypes, void (func)(char *line, void *param), void *param)
 {
 	static UT_string *line = NULL;
-
 
 	if (!strcmp(j->key, "_type"))
 		return;
@@ -1164,6 +1179,12 @@ void xml_output(JsonNode *json, output_type otype, JsonNode *fields, void (*func
 			json_foreach(node, fields) {
 				if ((j = json_find_member(one, node->string_)) != NULL) {
 					emit_one(j, inttypes, func, param);
+				} else {
+					/* empty element */
+					char label[128];
+
+					snprintf(label, sizeof(label), "  <%s />", node->string_);
+					func(label, param);
 				}
 			}
 		} else {
@@ -1176,4 +1197,16 @@ void xml_output(JsonNode *json, output_type otype, JsonNode *fields, void (*func
 	func("</owntracks>", param);
 
 	json_delete(inttypes);
+}
+
+char *storage_userphoto(char *username)
+{
+	static char path[BUFSIZ];
+
+	if (!username || !*username)
+		return (NULL);
+
+	snprintf(path, sizeof(path), "%s/photos/%s/%s.png", STORAGEDIR, username, username);
+
+	return (path);
 }
